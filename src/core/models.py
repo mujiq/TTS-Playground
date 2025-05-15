@@ -57,6 +57,24 @@ class TTSResponse(BaseModel):
             }
         }
 
+class TTSHistoryItem(BaseModel):
+    """Model for an individual TTS history item"""
+    id: int = Field(..., description="Unique ID of the TTS request")
+    text: str = Field(..., description="Text that was converted to speech")
+    language_code: str = Field(..., description="Language code used")
+    avatar: Optional[Dict] = Field(None, description="Avatar used for voice")
+    model_id: Optional[str] = Field(None, description="ID of the model used")
+    file_path: Optional[str] = Field(None, description="File path of the audio file")
+    file_url: Optional[str] = Field(None, description="URL to access the audio file")
+    duration_seconds: Optional[float] = Field(None, description="Duration of the audio in seconds")
+    processing_time: Optional[float] = Field(None, description="Time taken to process the request")
+    created_at: str = Field(..., description="Timestamp when the request was created")
+
+class TTSHistoryResponse(BaseModel):
+    """Response model for TTS history"""
+    total: int = Field(..., description="Total number of history items")
+    items: List[TTSHistoryItem] = Field(..., description="List of TTS history items")
+
 class BatchTTSItem(BaseModel):
     """Individual item in a batch TTS request"""
     id: str = Field(..., description="Unique identifier for this batch item")
@@ -135,9 +153,46 @@ class ResourceUsage(BaseModel):
 class WorkerStats(BaseModel):
     """Statistics for a Ray worker"""
     worker_id: str
+    model_id: Optional[str] = None
     hostname: str
-    resources: ResourceUsage
     tasks_processed: int
+    last_accessed: Optional[str] = None
+    resources: Optional[Dict[str, Any]] = None
+
+class NodeMetrics(BaseModel):
+    """Metrics for a Ray node"""
+    node_id: str
+    node_ip: str
+    hostname: str
+    cpu_total: float
+    cpu_used: float
+    memory_total: float
+    memory_used: float
+    gpu_total: Optional[float] = None
+    gpu_used: Optional[float] = None
+    uptime_seconds: Optional[float] = None
+    ray_version: Optional[str] = None
+    workers: Optional[int] = None
+    actor_count: Optional[int] = None
+
+class ClusterResources(BaseModel):
+    """Ray cluster resource usage"""
+    cpu_total: float
+    cpu_used: float
+    cpu_percent: float
+    memory_total: float
+    memory_used: float
+    memory_percent: float
+
+class GPUMetrics(BaseModel):
+    """GPU metrics"""
+    gpu_id: int
+    node_id: str
+    usage_percent: float
+    memory_used: float
+    memory_total: float
+    temperature: Optional[float] = None
+    power: Optional[float] = None
 
 class SystemStats(BaseModel):
     """Overall system statistics"""
@@ -147,9 +202,11 @@ class SystemStats(BaseModel):
     active_workers: int
     total_gpus: int
     active_gpus: int
-    cluster_resources: ResourceUsage
-    workers: List[WorkerStats]
-    jobs_pending: int
-    jobs_running: int
-    jobs_completed: int
-    jobs_failed: int 
+    cluster_resources: Optional[Dict[str, Any]] = None
+    node_metrics: Optional[List[Dict[str, Any]]] = None
+    workers: List[Dict[str, Any]]
+    gpu_info: List[Dict[str, Any]]
+    jobs_pending: Optional[int] = 0
+    jobs_running: Optional[int] = 0
+    jobs_completed: Optional[int] = 0
+    jobs_failed: Optional[int] = 0 

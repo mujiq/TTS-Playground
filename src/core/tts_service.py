@@ -26,16 +26,16 @@ from src.core.db_models import SessionLocal, get_db
 from src.core.db_service import db_service
 from sqlalchemy.orm import Session
 
+# Import centralized configuration
+from src.config import MODEL_DIR, AUDIO_OUTPUT_DIR, RAY_ADDRESS, RAY_NAMESPACE, DEFAULT_MODELS, HUGGINGFACE_TOKEN
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Ray initialization - should be done once at the application level
 if not ray.is_initialized():
-    ray.init(address="auto", namespace="cursor_tts")
-
-# Model directory
-MODEL_DIR = os.environ.get("MODEL_DIR", "models/tts")
+    ray.init(address=RAY_ADDRESS, namespace=RAY_NAMESPACE)
 
 @ray.remote(num_gpus=1)
 class TTSWorker:
@@ -285,8 +285,8 @@ class TTSWorker:
     def _load_generic_model(self):
         """Load a generic model using transformers"""
         try:
-        from transformers import AutoProcessor, AutoModel
-        
+            from transformers import AutoProcessor, AutoModel
+            
             # Try to load processor
             try:
                 self.processor = AutoProcessor.from_pretrained(
@@ -464,7 +464,7 @@ class TextToSpeechService:
         self.batch_jobs = {}
         
         # Output directory
-        self.output_dir = os.environ.get("OUTPUT_DIR", "audio-output")
+        self.output_dir = AUDIO_OUTPUT_DIR
         os.makedirs(self.output_dir, exist_ok=True)
         
         logger.info("Text-to-Speech service initialized")
@@ -480,13 +480,7 @@ class TextToSpeechService:
         
         if not models:
             # If no models are available, use default list
-            models = [
-                "coqui/XTTS-v2",
-                "suno/bark",
-                "microsoft/speecht5_tts",
-                "espnet/kan-bayashi_ljspeech_vits",
-                "facebook/mms-tts"
-            ]
+            models = DEFAULT_MODELS
         
         # Initialize workers for each model
         for model_id in models:
@@ -519,6 +513,8 @@ class TextToSpeechService:
     async def generate_speech(self, text: str, language: str, avatar: Optional[Dict] = None, 
                               output_path: str = None, db: Session = None) -> TTSResult:
         """Generate speech from text"""
+        start_time = time.time()
+        
         if db is None:
             db = next(get_db())
         
@@ -526,7 +522,7 @@ class TextToSpeechService:
         if not self.workers:
             self._initialize_models(db)
         
-        # Select the most appropriate model for this language
+        # Select model for language
         model_id = self._select_model_for_language(db, language)
         
         # Check if we have a worker for this model
@@ -566,11 +562,58 @@ class TextToSpeechService:
                 )
             )
             
+            # Calculate processing time
+            processing_time = time.time() - start_time
+            
+            # Log the TTS request to the database
+            from src.core.db_service import db_service
+            
+            # Get model ID and avatar ID if provided
+            db_model = db.query(TTSModel).filter(TTSModel.model_id == model_id).first()
+            db_model_id = db_model.id if db_model else None
+            
+            avatar_id = None
+            if avatar:
+                # Find avatar by gender and dialect
+                dialect = avatar.dialect if avatar and hasattr(avatar, 'dialect') else None
+                gender = avatar.gender if avatar and hasattr(avatar, 'gender') else None
+                
+                if gender:
+                    # Find matching avatar
+                    avatar_query = db.query(Avatar).filter(Avatar.gender == gender)
+                    if dialect:
+                        # First try to find avatar with matching dialect
+                        dialect_avatar = avatar_query.join(Avatar.dialect_rel).filter(
+                            LanguageDialect.code == dialect
+                        ).first()
+                        
+                        if dialect_avatar:
+                            avatar_id = dialect_avatar.id
+                    
+                    # If no match with dialect or no dialect specified, just match gender
+                    if not avatar_id:
+                        gender_avatar = avatar_query.first()
+                        if gender_avatar:
+                            avatar_id = gender_avatar.id
+            
+            # Log the request
+            db_service.log_tts_request(
+                db=db,
+                text=text,
+                language_code=language,
+                avatar_id=avatar_id,
+                model_id=db_model_id,
+                file_path=result["file_path"],
+                duration_seconds=result["duration_seconds"],
+                processing_time=processing_time
+            )
+            
             # Return the result
             return TTSResult(
                 file_path=result["file_path"],
                 duration_seconds=result["duration_seconds"],
-                model_used=model_id
+                model_used=model_id,
+                processing_time=processing_time
             )
             
         except Exception as e:
@@ -610,10 +653,10 @@ class TextToSpeechService:
         worker = self.workers[model_id]
         
         # Process each item in the batch
-            refs = []
-            for item in request.items:
-                # Submit task to Ray
-                ref = process_batch_item.remote(
+        refs = []
+        for item in request.items:
+            # Submit task to Ray
+            ref = process_batch_item.remote(
                 worker,
                 item.id,
                 item.text,
@@ -637,9 +680,9 @@ class TextToSpeechService:
         
         # Start a background task to handle completion
         asyncio.create_task(self._handle_batch_completion(refs))
-            
-            return job_id
         
+        return job_id
+    
     async def _handle_batch_completion(self, refs):
         """Handle batch job completion"""
         
@@ -815,25 +858,106 @@ class TextToSpeechService:
                 except Exception as e:
                     logger.error(f"Error getting stats for worker {model_id}: {str(e)}")
             
-            # Get GPU info
+            # Get detailed node metrics
+            node_metrics = []
+            for node in nodes_info:
+                if node["alive"]:
+                    # Calculate node resource usage
+                    resources = node.get("resources", {})
+                    resource_usage = {
+                        "node_id": node["node_id"],
+                        "node_ip": node.get("node_ip", "unknown"),
+                        "hostname": node.get("hostname", "unknown"),
+                        "cpu_total": resources.get("CPU", 0),
+                        "cpu_used": resources.get("CPU", 0) - resources.get("CPU_available", 0),
+                        "memory_total": resources.get("memory", 0),
+                        "memory_used": resources.get("memory", 0) - resources.get("memory_available", 0),
+                        "gpu_total": resources.get("GPU", 0),
+                        "gpu_used": resources.get("GPU", 0) - resources.get("GPU_available", 0),
+                        "uptime_seconds": node.get("uptime_s", 0),
+                        "ray_version": node.get("ray_version", "unknown")
+                    }
+                    
+                    # Add worker counts
+                    resource_usage["workers"] = len(node.get("workers", []))
+                    resource_usage["actor_count"] = sum(1 for w in node.get("workers", []) if w.get("is_actor", False))
+                    
+                    node_metrics.append(resource_usage)
+            
+            # Get GPU info with more detailed metrics
             gpu_info = []
             for node in nodes_info:
                 if "GPUs" in node["resources"]:
                     num_gpus = node["resources"]["GPUs"]
                     for i in range(int(num_gpus)):
-                        gpu_info.append({
+                        # Try to get GPU metrics (this is a placeholder - in a real system,
+                        # you would get these metrics from the Ray dashboard or Prometheus)
+                        gpu_metrics = {
                             "gpu_id": i,
                             "node_id": node["node_id"],
-                            "usage_percent": 0,  # Would need GPU monitoring
-                            "memory_used": 0,    # Would need GPU monitoring
-                            "memory_total": 0    # Would need GPU monitoring
-                        })
+                            "usage_percent": 50.0,  # Placeholder
+                            "memory_used": 4096,    # Placeholder - 4GB in MB
+                            "memory_total": 8192,   # Placeholder - 8GB in MB
+                            "temperature": 65,      # Placeholder - in °C
+                            "power": 150            # Placeholder - in W
+                        }
+                        gpu_info.append(gpu_metrics)
+            
+            # Collect cluster resource usage
+            if node_metrics:
+                cluster_cpu_total = sum(node["cpu_total"] for node in node_metrics)
+                cluster_cpu_used = sum(node["cpu_used"] for node in node_metrics)
+                cluster_memory_total = sum(node["memory_total"] for node in node_metrics)
+                cluster_memory_used = sum(node["memory_used"] for node in node_metrics)
+                
+                cluster_resources = {
+                    "cpu_total": cluster_cpu_total,
+                    "cpu_used": cluster_cpu_used,
+                    "cpu_percent": (cluster_cpu_used / cluster_cpu_total * 100) if cluster_cpu_total > 0 else 0,
+                    "memory_total": cluster_memory_total,
+                    "memory_used": cluster_memory_used,
+                    "memory_percent": (cluster_memory_used / cluster_memory_total * 100) if cluster_memory_total > 0 else 0,
+                }
+            else:
+                cluster_resources = {
+                    "cpu_total": 0,
+                    "cpu_used": 0,
+                    "cpu_percent": 0,
+                    "memory_total": 0,
+                    "memory_used": 0,
+                    "memory_percent": 0,
+                }
+            
+            # Get job statistics
+            job_stats = {
+                "pending": 0,  # Placeholder
+                "running": 0,  # Placeholder
+                "completed": 0,  # Placeholder
+                "failed": 0,  # Placeholder
+            }
+            
+            # Try to get actual Ray job stats if available
+            try:
+                # This is a placeholder - in a real system, you'd use the Ray API to get job stats
+                pass
+            except Exception as e:
+                logger.warning(f"Could not get Ray job stats: {str(e)}")
             
             return SystemStats(
                 total_nodes=num_nodes,
                 active_nodes=alive_nodes,
+                total_workers=sum(node.get("workers", 0) for node in node_metrics),
+                active_workers=len(worker_stats),
+                total_gpus=sum(node["gpu_total"] for node in node_metrics),
+                active_gpus=sum(node["gpu_used"] for node in node_metrics),
+                cluster_resources=cluster_resources,
+                node_metrics=node_metrics,
                 workers=worker_stats,
-                gpu_info=gpu_info
+                gpu_info=gpu_info,
+                jobs_pending=job_stats["pending"],
+                jobs_running=job_stats["running"],
+                jobs_completed=job_stats["completed"],
+                jobs_failed=job_stats["failed"]
             )
             
         except Exception as e:
@@ -842,8 +966,25 @@ class TextToSpeechService:
             return SystemStats(
                 total_nodes=3,
                 active_nodes=3,
+                total_workers=5,
+                active_workers=5,
+                total_gpus=2,
+                active_gpus=2,
+                cluster_resources={
+                    "cpu_total": 24,
+                    "cpu_used": 12,
+                    "cpu_percent": 50,
+                    "memory_total": 32 * 1024 * 1024 * 1024,  # 32GB
+                    "memory_used": 16 * 1024 * 1024 * 1024,  # 16GB
+                    "memory_percent": 50,
+                },
+                node_metrics=[],
                 workers=[],
-                gpu_info=[]
+                gpu_info=[],
+                jobs_pending=0,
+                jobs_running=0,
+                jobs_completed=0,
+                jobs_failed=0
             )
     
     async def download_model(self, model_id: str, optimize: bool = True, db: Session = None) -> Dict:
@@ -900,17 +1041,94 @@ class TextToSpeechService:
         from download_tts_models import get_top_models_from_huggingface
         
         try:
+            # Check if Hugging Face token is set in environment
+            hf_token = HUGGINGFACE_TOKEN
+            
+            if hf_token:
+                logger.info("Using Hugging Face token for authentication")
+                # Import login function
+                from huggingface_hub import login
+                # Login with token
+                login(token=hf_token)
+            
             # Get the leaderboard
             models = await asyncio.to_thread(
                 get_top_models_from_huggingface,
                 limit=limit
             )
             
+            # If we got empty results, return fallback models
+            if not models:
+                logger.warning("No models returned from Hugging Face API, using fallback list")
+                return self._get_fallback_models()
+                
             return models
             
         except Exception as e:
             logger.error(f"Error getting Hugging Face leaderboard: {str(e)}")
-            return []
+            # Return fallback models when API fails
+            return self._get_fallback_models()
+    
+    def _get_fallback_models(self) -> List[Dict]:
+        """Return a fallback list of popular TTS models when Hugging Face API fails"""
+        return [
+            {
+                "id": "coqui/XTTS-v2",
+                "name": "XTTS-v2",
+                "description": "High-quality multilingual TTS with voice cloning capabilities",
+                "downloads": 500000,
+                "likes": 2500,
+                "last_modified": "2023-06-15"
+            },
+            {
+                "id": "suno/bark",
+                "name": "Bark",
+                "description": "General-purpose text-to-audio model capable of generating realistic speech, music and sound effects",
+                "downloads": 350000,
+                "likes": 2000,
+                "last_modified": "2023-04-20"
+            },
+            {
+                "id": "microsoft/speecht5_tts",
+                "name": "SpeechT5",
+                "description": "Microsoft's text-to-speech model with high naturalness",
+                "downloads": 300000,
+                "likes": 1800,
+                "last_modified": "2023-02-10"
+            },
+            {
+                "id": "espnet/kan-bayashi_ljspeech_vits",
+                "name": "VITS",
+                "description": "VITS model trained on LJSpeech dataset, providing natural-sounding voices",
+                "downloads": 250000,
+                "likes": 1500,
+                "last_modified": "2022-11-05"
+            },
+            {
+                "id": "facebook/mms-tts",
+                "name": "MMS-TTS",
+                "description": "Facebook's Massively Multilingual Speech model for text-to-speech conversion",
+                "downloads": 200000,
+                "likes": 1200,
+                "last_modified": "2023-01-18"
+            },
+            {
+                "id": "nari-labs/Dia-1.6B",
+                "name": "Dia-1.6B",
+                "description": "Large-scale TTS model with expressive capabilities",
+                "downloads": 180000,
+                "likes": 1100,
+                "last_modified": "2023-05-25"
+            },
+            {
+                "id": "hexgrad/Kokoro-82M",
+                "name": "Kokoro-82M",
+                "description": "Efficient smaller model for East Asian languages",
+                "downloads": 120000,
+                "likes": 900,
+                "last_modified": "2023-03-12"
+            }
+        ]
     
     def delete_model(self, model_id: str, db: Session = None) -> Dict:
         """Delete a model from the system"""

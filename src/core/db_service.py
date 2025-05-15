@@ -271,6 +271,27 @@ class DatabaseService:
         return db.query(TTSModel).order_by(
             func.l2_distance(TTSModel.embedding, embedding)
         ).limit(limit).all()
+    
+    def get_tts_history(
+        self,
+        db: Session,
+        limit: int = 100,
+        offset: int = 0
+    ) -> List[Dict]:
+        """Get TTS conversion history"""
+        tts_requests = (
+            db.query(TTSRequest)
+            .order_by(TTSRequest.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
+        
+        return [req.to_dict() for req in tts_requests]
+    
+    def get_tts_history_count(self, db: Session) -> int:
+        """Get total count of TTS history records"""
+        return db.query(TTSRequest).count()
 
 # Create a singleton instance
 db_service = DatabaseService() 

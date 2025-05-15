@@ -9,26 +9,48 @@ import ray
 import json
 import time
 from datetime import datetime
+from fastapi.staticfiles import StaticFiles
 
 # Import core TTS functionality (to be implemented)
 from src.core.tts_service import TextToSpeechService
-from src.core.models import TTSRequest, TTSResponse, TTSResult, Avatar, BatchTTSRequest, BatchTTSItem, BatchTTSItemStatus, BatchTTSJobStatus, ModelInfo, LanguageInfo, AvatarInfo, SystemStats
+from src.core.models import TTSRequest, TTSResponse, TTSResult, Avatar, BatchTTSRequest, BatchTTSItem, BatchTTSItemStatus, BatchTTSJobStatus, ModelInfo, LanguageInfo, AvatarInfo, SystemStats, TTSHistoryResponse
 
 # Import database dependencies
 from src.core.db_models import get_db
 from sqlalchemy.orm import Session
+from src.core.db import get_db
+from src.core.db_service import db_service
+
+# Import centralized configuration
+from src.config import (
+    API_HOST, API_PORT, DEBUG_MODE, CORS_ORIGINS, 
+    AUDIO_OUTPUT_DIR, LOG_LEVEL, LOG_FORMAT
+)
+
+# Set up logging
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format=LOG_FORMAT,
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 # Create FastAPI app
 app = FastAPI(
     title="TextToSpeech Playground API",
     description="API for generating high-quality speech from text with selectable languages and avatars",
-    version="1.0.0"
+    version="1.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc"
 )
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, specify exact domains
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,6 +62,9 @@ tts_service = TextToSpeechService()
 # Define output directory
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "audio-output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Mount the output directory as a static files directory
+app.mount("/audio-output", StaticFiles(directory=OUTPUT_DIR), name="audio-output")
 
 @app.get("/")
 async def root():
@@ -120,12 +145,37 @@ def get_batch_job_status(job_id: str, db: Session = Depends(get_db)):
 @app.get("/languages", response_model=List[LanguageInfo])
 def get_supported_languages(db: Session = Depends(get_db)):
     """Get supported languages"""
-    return tts_service.get_supported_languages(db)
+    try:
+        languages = db_service.get_languages(db)
+        return [
+            LanguageInfo(
+                code=lang["code"],
+                name=lang["name"],
+                dialects=[
+                    {"code": d["code"], "name": d["name"]} 
+                    for d in lang.get("dialects", [])
+                ] if lang.get("dialects") else None
+            )
+            for lang in languages
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get languages: {str(e)}")
 
 @app.get("/avatars", response_model=List[AvatarInfo])
 def get_available_avatars(db: Session = Depends(get_db)):
     """Get available avatars"""
-    return tts_service.get_available_avatars(db)
+    try:
+        avatars = db_service.get_avatars(db)
+        return [
+            AvatarInfo(
+                gender=avatar["gender"],
+                dialect=avatar.get("dialect"),
+                description=avatar["description"]
+            )
+            for avatar in avatars
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get avatars: {str(e)}")
 
 @app.get("/models", response_model=List[ModelInfo])
 def list_available_models(db: Session = Depends(get_db)):
@@ -136,6 +186,30 @@ def list_available_models(db: Session = Depends(get_db)):
 def get_system_stats(db: Session = Depends(get_db)):
     """Get system statistics"""
     return tts_service.get_system_stats(db)
+
+@app.get("/tts/history", response_model=TTSHistoryResponse)
+def get_tts_history(
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db)
+):
+    """Get TTS conversion history"""
+    try:
+        # Get history items
+        history_items = db_service.get_tts_history(db, limit=limit, offset=offset)
+        total_count = db_service.get_tts_history_count(db)
+        
+        # Process items to add file URLs
+        for item in history_items:
+            if item.get("file_path"):
+                item["file_url"] = item["file_path"].replace(OUTPUT_DIR, "/audio-output")
+        
+        return TTSHistoryResponse(
+            total=total_count,
+            items=history_items
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get TTS history: {str(e)}")
 
 @app.get("/audio-output/{filename}")
 def get_audio_file(filename: str):
@@ -229,6 +303,16 @@ async def download_multiple_models(model_ids: List[str], optimize: bool = True, 
         "results": results
     }
 
-if __name__ == "__main__":
+def main():
+    """Run the API server"""
+    # This is used when running directly, rather than through uvicorn
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run(
+        "src.api.main:app", 
+        host=API_HOST, 
+        port=API_PORT,
+        reload=DEBUG_MODE
+    )
+
+if __name__ == "__main__":
+    main() 
