@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  # Backend API tests
+  api-test:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    volumes:
+      - ../tests:/app/tests
+    environment:
+      - API_BASE_URL=http://loadbalancer/api
+      - DATABASE_URL=postgresql://cursor_admin:xh7Gt5p9JQk2Vb8Z3eR2yF4W@postgres:5432/cursor_tts_db
+    command: >
+      bash -c "cd /app/tests/backend && 
+               pip3 install pytest requests && 
+               chmod +x run_tests.sh && 
+               ./run_tests.sh"
+    depends_on:
+      - loadbalancer
+      - postgres
+    networks:
+      - app-network
+
+  # Frontend component tests
+  frontend-component-test:
+    image: node:18-alpine
+    volumes:
+      - ../frontend:/app/frontend
+      - ../tests:/app/tests
+    working_dir: /app/tests/frontend
+    environment:
+      - APP_URL=http://loadbalancer
+    command: >
+      sh -c "chmod +x run_tests.sh &&
+             ./run_tests.sh"
+    depends_on:
+      - loadbalancer
+    networks:
+      - app-network
+
+  # End-to-end tests
+  e2e-test:
+    image: mcr.microsoft.com/playwright:latest
+    volumes:
+      - ../frontend:/app/frontend
+      - ../tests:/app/tests
+    working_dir: /app/tests/frontend
+    environment:
+      - APP_URL=http://loadbalancer
+      - TEST_TYPE=e2e
+    command: >
+      bash -c "chmod +x run_tests.sh &&
+               ./run_tests.sh"
+    depends_on:
+      - loadbalancer
+    networks:
+      - app-network
+
+  # Import services from main docker-compose.yml
+  postgres:
+    extends:
+      file: ../docker-compose.yml
+      service: postgres
+    networks:
+      - app-network
+
+  ray-head:
+    extends:
+      file: ../docker-compose.yml
+      service: ray-head
+    networks:
+      - app-network
+
+  ray-worker-1:
+    extends:
+      file: ../docker-compose.yml
+      service: ray-worker-1
+    networks:
+      - app-network
+
+  ray-worker-2:
+    extends:
+      file: ../docker-compose.yml
+      service: ray-worker-2
+    networks:
+      - app-network
+
+  frontend:
+    extends:
+      file: ../docker-compose.yml
+      service: frontend
+    networks:
+      - app-network
+
+  loadbalancer:
+    extends:
+      file: ../docker-compose.yml
+      service: loadbalancer
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge 
