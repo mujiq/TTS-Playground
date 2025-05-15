@@ -54,4 +54,19 @@ Thumbs.db
 audio-output/
 models/
 .cache/
-*.log 
+*.log
+
+# Large binaries and installers
+*.exe
+*.msi
+*.dll
+*.lib
+*.bin
+miniconda.exe
+node.msi
+nvm-setup.exe
+libscipy_openblas64_*.dll
+arrow.dll
+arrow_flight.dll
+torch_cpu.dll
+torch_python.dll 
